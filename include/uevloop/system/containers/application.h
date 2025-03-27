@@ -59,7 +59,7 @@ void uel_app_init(uel_application_t *app);
   * \param modules The modules to be loaded
   * \param module_count The number of modules being loaded
   */
-void uel_app_load(uel_application_t *app, uel_module_t **modules, size_t module_count);
+bool uel_app_load(uel_application_t *app, uel_module_t **modules, size_t module_count);
 
 /** \brief Fetches a module from the app's registry
   *

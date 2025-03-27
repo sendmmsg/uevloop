@@ -11,10 +11,10 @@ void uel_module_init(
     module->app = app;
 }
 
-void uel_module_config(uel_module_t *module){
-    module->config(module);
+bool uel_module_config(uel_module_t *module){
+    return module->config(module);
 }
 
-void uel_module_launch(uel_module_t *module){
-    module->launch(module);
+bool uel_module_launch(uel_module_t *module){
+    return module->launch(module);
 }

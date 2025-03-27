@@ -1,4 +1,5 @@
 #include "uevloop/system/containers/application.h"
+#include <stdio.h>
 
 void uel_app_init(uel_application_t *app){
     uel_syspools_init(&app->pools);
@@ -25,15 +26,37 @@ void uel_app_init(uel_application_t *app){
     app->registry_size = 0;
 }
 
-void uel_app_load(uel_application_t *app, uel_module_t **modules, size_t module_count){
+bool uel_app_load(uel_application_t *app, uel_module_t **modules, size_t module_count){
+    bool init_status = true;
     for (size_t i = 0; i < module_count; i++) {
-        uel_module_config(modules[i]);
+        modules[i]->configured = uel_module_config(modules[i]);
+        if(modules[i]->configured == false){
+            fprintf(stderr, "Failed to configure module %ld\n", i);
+            init_status = false;
+        }
     }
     for (size_t i = 0; i < module_count; i++) {
-        uel_module_launch(modules[i]);
+        modules[i]->launched = uel_module_launch(modules[i]);
+        if(modules[i]->launched == false){
+            fprintf(stderr, "Failed to launch module %ld\n", i);
+            init_status = false;
+        }
     }
     app->registry_size = module_count;
     app->registry = modules;
+    /* bool load_status = true; */
+    /* for (size_t i = 0; i < module_count; i++) { */
+    /*     config_status[i] = uel_module_config(modules[i]); */
+    /*     if(!config_status[i]) */
+    /*         load_status = false; */
+    /* } */
+    /* for (size_t i = 0; i < module_count; i++) { */
+    /*     launch_status[i] = uel_module_launch(modules[i]); */
+    /*     if(!launch_status[i]) */
+    /*         load_status = false; */
+    /* } */
+
+    return init_status;
 }
 
 uel_module_t *uel_app_require(uel_application_t *app, size_t id){

@@ -3,13 +3,14 @@
 
 #ifndef UEL_MODULE_H
 #define UEL_MODULE_H
+#include <stdbool.h>
 
 struct uel_application;
 struct uel_module;
 
 /** \brief Defines a module hook to be called during the module lifecycle
   */
-typedef void (*uel_module_hook_t)(struct uel_module *);
+typedef bool (*uel_module_hook_t)(struct uel_module *);
 
 /** \brief A module is an isolated unit of behaviour with lifecycle hooks
   *
@@ -37,6 +38,8 @@ struct uel_module {
     uel_module_hook_t launch;
     //! Keeps a reference to the application onto which the module is loaded
     struct uel_application *app;
+    bool configured;
+    bool launched;
 };
 
 /** \brief Initialised a module
@@ -57,12 +60,12 @@ void uel_module_init(
   *
   * \param module The modules to config
   */
-void uel_module_config(uel_module_t *module);
+bool uel_module_config(uel_module_t *module);
 
 /** \brief Calls the launch hook of a module
   *
   * \param module The modules to launch
   */
-void uel_module_launch(uel_module_t *module);
+bool uel_module_launch(uel_module_t *module);
 
 #endif /* end of include guard: UEL_MODULE_H */
