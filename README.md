@@ -2,6 +2,8 @@
 
 A fast and lightweight event loop aimed at embedded platforms in C99.
 
+Forked to incorporate [uLog](https://github.com/rdpoor/ulog) and [minicoro](https://github.com/edubart/minicoro) as well as some other goodies (arena allocator etc)
+
 <!-- TOC depthFrom:2 depthTo:6 withLinks:1 updateOnSave:1 orderedList:0 -->
 
 - [About](#about)

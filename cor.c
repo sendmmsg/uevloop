@@ -1,8 +1,6 @@
 #include "uevloop/utils/linked-list.h"
 #include "uevloop/utils/module.h"
 #include <bits/time.h>
-#define MINICORO_IMPL
-#include "minicoro.h"
 #include "uevloop/system/containers/application.h"
 #include "uevloop/system/containers/system-pools.h"
 #include "uevloop/system/containers/system-queues.h"
@@ -26,8 +24,28 @@
 #include "ulog.h"
 #define _XOPEN_SOURCE /* See feature_test_macros(7) */
 #include <time.h>
+void *my_alloc(size_t size);
+void my_dealloc(void *ptr);
+#define MCO_ALLOC(size) my_alloc(size)
+#define MCO_DEALLOC(ptr, size) my_dealloc(ptr)
+#define MINICORO_IMPL
+#include "minicoro.h"
 char timestamp[256];
 char* get_timestamp();
+int allocs = 0;
+void my_dealloc(void *ptr){
+  allocs--;
+  ULOG_WARNING("De-allocating pointer %p, allocs: %d\n", ptr, allocs);
+  free(ptr);
+}
+void *my_alloc(size_t size){
+  allocs++;
+  void *ptr = calloc(1, size);
+  ULOG_WARNING("Allocated pointer %p, size: %ld, allocs: %d\n", ptr, size, allocs);
+
+  return ptr;
+}
+
 
 const char *mco_state_str[] = {[MCO_DEAD] = "MCO_DEAD",
                                [MCO_NORMAL] = "MCO_NORMAL",
@@ -294,6 +312,11 @@ void usr2_handler(int sig) {
     ULOG_ERROR("Attempting to resume coroutine %p in state: %s", co, mco_state_str[mco_status(co)]);
   }
 }
+void usr1_handler(int sig) {
+  static int current_val = 0;
+  // Check if anyone is waiting for the signal
+  keep_running = false;
+}
 
 int main(int argc, char **argv) {
   ULOG_INIT();
@@ -305,7 +328,7 @@ int main(int argc, char **argv) {
   ULOG_INFO("Starting.."); // logs to file and console
   // remove a logger
   /* ULOG_UNSUBSCRIBE(my_file_logger); */
-  /* signal(SIGUSR1, usr1_handler); */
+  signal(SIGUSR1, usr1_handler);
   signal(SIGUSR2, usr2_handler);
   uel_app_init(&eyra_app);
   setup_timer();
@@ -335,6 +358,7 @@ int main(int argc, char **argv) {
     wait_timer();
     uel_app_tick(&eyra_app);
   }
+  ULOG_INFO("Quitting");
 }
 bool easync_resume_coroutine(coroutine_func fp, void *user_data) {
   mco_desc desc = mco_desc_init(fp, 0);
