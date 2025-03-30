@@ -8,6 +8,7 @@
 #include "uevloop/system/scheduler.h"
 #include "uevloop/utils/circular-queue.h"
 #include "uevloop/utils/closure.h"
+#include "uevloop/utils/object-pool.h"
 #include <bits/types/timer_t.h>
 #include <err.h>
 #include <inttypes.h>
@@ -33,14 +34,28 @@ void my_dealloc(void *ptr);
 char timestamp[256];
 char* get_timestamp();
 int allocs = 0;
+
+typedef struct _coro_stack {
+  // should match mco_desc.storage_size
+  // which is determined on runtime (depending on arch, mechanism?)
+    char str[58656];
+} coro_stack_t;
+
+
+// The log2 of our pool size.
+#define CORO_STACK_POOL_SIZE_LOG2N   (5)
+UEL_DECLARE_OBJPOOL_BUFFERS(coro_stack_t, CORO_STACK_POOL_SIZE_LOG2N, coro_stack_pool);
+uel_objpool_t coro_stack_pool;
+// my_pool now is a pool with 32 (2**5) obj_t
+
 void my_dealloc(void *ptr){
   allocs--;
   ULOG_WARNING("De-allocating pointer %p, allocs: %d\n", ptr, allocs);
-  free(ptr);
+  uel_objpool_release(&coro_stack_pool, ptr);
 }
 void *my_alloc(size_t size){
   allocs++;
-  void *ptr = calloc(1, size);
+  void *ptr = uel_objpool_acquire(&coro_stack_pool);
   ULOG_WARNING("Allocated pointer %p, size: %ld, allocs: %d\n", ptr, size, allocs);
 
   return ptr;
@@ -52,17 +67,16 @@ const char *mco_state_str[] = {[MCO_DEAD] = "MCO_DEAD",
                                [MCO_RUNNING] = "MCO_RUNNING",
                                [MCO_SUSPENDED] = "MCO_SUSPENDED"};
 
+FILE* fp_log_file = NULL;
 void my_file_logger(ulog_level_t severity, char *msg) {
-  static FILE* fp = NULL;
-  if(fp == NULL) {
-    fp = fopen("cor.log", "w+");
-    if(fp)
-      fseek(fp,0, SEEK_END);
+  if(fp_log_file == NULL) {
+    fprintf(stderr,"log file must be opened before logging to it!\n");
+    exit(1);
   }
-  if(fp != NULL){
-    fprintf(fp, "%s [%s]: %s\n", get_timestamp(), ulog_level_name(severity), msg);
-    fflush(fp);
-  }
+
+  fseek(fp_log_file,0, SEEK_END);
+  fprintf(fp_log_file, "%s [%s]: %s\n", get_timestamp(), ulog_level_name(severity), msg);
+  fflush(fp_log_file);
 }
 void my_console_logger(ulog_level_t severity, char *msg) {
   printf("%s %s [%s]: %s\n", ulog_level_color(severity), get_timestamp(), ulog_level_name(severity), msg);
@@ -78,13 +92,18 @@ typedef void (*coroutine_func)(mco_coro *);
 // Closures can be reused, no need to recreate it all the time
 uel_closure_t easync_resume_coro_clo;
 uel_closure_t easync_timeout_coro_clo;
+uel_closure_t raise_signal_clo;
 
 #define SIGNAL_QUEUE_BUFFER_SIZE_LOG2N (4)
 uel_cqueue_t easync_signal_closure_queue[32];
 void *_easync_signal_closure_buffer[32 * (1 << SIGNAL_QUEUE_BUFFER_SIZE_LOG2N)];
 
-bool easync_resume_coroutine(coroutine_func fp, void *user_data);
 
+
+
+
+
+bool easync_spawn_coroutine(coroutine_func fp, void *user_data);
 // Tick the timer every ms
 void easync_timer_isr() { uel_app_update_timer(&eyra_app, ++counter); }
 
@@ -234,6 +253,37 @@ void async_print_and_delay(mco_coro *task) {
   }
 }
 
+char uart_buffer[1024];
+// MCO coroutine that "transmits over UART", waits on TX completion, "registers to receive on UART" and awaits RX completion
+void uart_send_and_receive(mco_coro *task) {
+  ULOG_INFO("started");
+  // tell the evloop to send a "TX completion signal"
+  uel_app_run_later(&eyra_app, 10, raise_signal_clo,(void*)(uintptr_t) SIGURG);
+  ULOG_INFO("Sending message");
+  snprintf(uart_buffer, 1024, "Sending some data: %p", task);
+  ULOG_INFO(" Yielding until TX interrupt (SIGURG)");
+  int rc = easync_task_await_signal(task, &eyra_app, SIGURG, 5000);
+    if (rc == SIGNAL_TIMEOUT) {
+      ULOG_ERROR("async_print_and_wait_signal -> timeout in waiting for signal, aborting!");
+      return;
+    }
+    if (rc == SIGNAL_CANCELLED) {
+      ULOG_ERROR("async_print_and_wait_signal -> task cancelled, returning!");
+      return;
+    }
+  ULOG_INFO("TX completed, now waiting for response (SIGVTALRM)");
+  // tell the evloop to send a "RX completion signal"
+  uel_app_run_later(&eyra_app, 10, raise_signal_clo,(void*)(uintptr_t) SIGVTALRM);
+  rc = easync_task_await_signal(task, &eyra_app, SIGVTALRM, 5000);
+  ULOG_INFO("RX completed! Got %s", uart_buffer);
+
+}
+void *raise_signal_func(void *context, void *params) {
+  uintptr_t signal = (uintptr_t) params;
+  ULOG_INFO("sending signal");
+  raise(signal);
+}
+
 void *easync_resume_coro_func(void *context, void *params) {
   mco_result res;
   mco_coro *co = (mco_coro *)params;
@@ -295,12 +345,12 @@ void setup_timer(void) {
 /// end timer
 
 /// Signal handler / poor-mans TX/RX interruot
-void usr2_handler(int sig) {
+void interrupt_handler(int sig) {
   static int current_val = 0;
   // Check if anyone is waiting for the signal
-  mco_coro *co = uel_cqueue_pop(&easync_signal_closure_queue[SIGUSR2]);
+  mco_coro *co = uel_cqueue_pop(&easync_signal_closure_queue[sig]);
   if (co == NULL) {
-    ULOG_INFO("No task waiting for signal %d", SIGUSR2);
+    ULOG_INFO("No task waiting for signal %d", sig);
     return;
   }
   ULOG_INFO("coroutine %p waiting to resume=> %s", co, mco_state_str[mco_status(co)]);
@@ -318,8 +368,14 @@ void usr1_handler(int sig) {
   keep_running = false;
 }
 
+void cont_handler(int sig){
+  // spawn a coroutine that transmits over UART, and receives a reply
+  easync_spawn_coroutine(uart_send_and_receive, (void *)(uintptr_t)1000);
+}
+
 int main(int argc, char **argv) {
   ULOG_INIT();
+  fp_log_file = fopen("cor.log", "w+");
   ULOG_SUBSCRIBE(my_console_logger, ULOG_DEBUG_LEVEL);
   ULOG_SUBSCRIBE(my_file_logger, ULOG_DEBUG_LEVEL);
   // dynamically change the threshold for a specific logger
@@ -329,7 +385,10 @@ int main(int argc, char **argv) {
   // remove a logger
   /* ULOG_UNSUBSCRIBE(my_file_logger); */
   signal(SIGUSR1, usr1_handler);
-  signal(SIGUSR2, usr2_handler);
+  signal(SIGUSR2, interrupt_handler);
+  signal(SIGURG, interrupt_handler);
+  signal(SIGCONT, cont_handler);
+  signal(SIGVTALRM, interrupt_handler);
   uel_app_init(&eyra_app);
   setup_timer();
 
@@ -341,26 +400,32 @@ int main(int argc, char **argv) {
                     SIGNAL_QUEUE_BUFFER_SIZE_LOG2N);
   }
 
+  // Initalize the space for the coroutine-stacks
+  // Used by MCO_ALLOC / MCO_DEALLOC
+  uel_objpool_init(&coro_stack_pool, CORO_STACK_POOL_SIZE_LOG2N, sizeof(coro_stack_t), UEL_OBJPOOL_BUFFERS(coro_stack_pool));
 
   // Initalize the closure that resumes coroutines passed as argument
   // Context == null, coroutine comes in param
   easync_resume_coro_clo = uel_closure_create(&easync_resume_coro_func, (void *)NULL);
   easync_timeout_coro_clo = uel_closure_create(&easync_timeout_coro_func, (void *)NULL);
+  raise_signal_clo = uel_closure_create(&raise_signal_func, (void *)NULL);
 
   uintptr_t value = 0;
   uel_closure_t print_values = uel_closure_create(&print_value, (void *)2);
   timer_handle = uel_app_run_at_intervals(&eyra_app, 1000, true, print_values, (void *)6);
-  easync_resume_coroutine(async_print_and_delay, (void *)(uintptr_t)2000);
-  easync_resume_coroutine(async_print_and_delay, (void *)(uintptr_t)1000);
-  easync_resume_coroutine(async_print_and_wait_signal, NULL);
+  easync_spawn_coroutine(async_print_and_delay, (void *)(uintptr_t)2000);
+  easync_spawn_coroutine(async_print_and_delay, (void *)(uintptr_t)1000);
+  easync_spawn_coroutine(async_print_and_wait_signal, NULL);
 
   while (keep_running) {
     wait_timer();
     uel_app_tick(&eyra_app);
   }
   ULOG_INFO("Quitting");
+  if(fp_log_file)
+    fclose(fp_log_file);
 }
-bool easync_resume_coroutine(coroutine_func fp, void *user_data) {
+bool easync_spawn_coroutine(coroutine_func fp, void *user_data) {
   mco_desc desc = mco_desc_init(fp, 0);
   desc.user_data = user_data;
   mco_coro *co;
