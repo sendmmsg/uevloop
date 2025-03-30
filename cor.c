@@ -27,40 +27,24 @@
 #define _XOPEN_SOURCE /* See feature_test_macros(7) */
 #include <time.h>
 char timestamp[256];
-char *get_timestamp(void) {
-  struct timespec tv;
-  char time_str[127];
-  double fractional_seconds;
-  int milliseconds;
-  struct tm tm; // our "broken down time"
+char* get_timestamp();
 
-  if (clock_gettime(CLOCK_REALTIME, &tv) == -1) {
-    perror("clock_gettime");
-    exit(EXIT_FAILURE);
+const char *mco_state_str[] = {[MCO_DEAD] = "MCO_DEAD",
+                               [MCO_NORMAL] = "MCO_NORMAL",
+                               [MCO_RUNNING] = "MCO_RUNNING",
+                               [MCO_SUSPENDED] = "MCO_SUSPENDED"};
+
+void my_file_logger(ulog_level_t severity, char *msg) {
+  static FILE* fp = NULL;
+  if(fp == NULL) {
+    fp = fopen("cor.log", "w+");
+    if(fp)
+      fseek(fp,0, SEEK_END);
   }
-
-  memset(&tm, 0, sizeof(struct tm));
-  sprintf(time_str, "%ld UTC", tv.tv_sec);
-
-  // convert our timespec into broken down time
-  strptime(time_str, "%s %U", &tm);
-
-  // do the math to convert nanoseconds to integer milliseconds
-  fractional_seconds = (double)tv.tv_nsec;
-  fractional_seconds /= 1e6;
-  fractional_seconds = round(fractional_seconds);
-  milliseconds = (int)fractional_seconds;
-
-  // print date and time without milliseconds
-
-  //ISO8601
-  //strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S", &tm);
-  strftime(time_str, sizeof(time_str), "%H:%M:%S", &tm);
-
-  // add on the fractional seconds and Z for the UTC Timezone
-  snprintf(timestamp, sizeof(timestamp), "%s.%.5d", time_str, milliseconds);
-
-  return timestamp;
+  if(fp != NULL){
+    fprintf(fp, "%s [%s]: %s\n", get_timestamp(), ulog_level_name(severity), msg);
+    fflush(fp);
+  }
 }
 void my_console_logger(ulog_level_t severity, char *msg) {
   printf("%s %s [%s]: %s\n", ulog_level_color(severity), get_timestamp(), ulog_level_name(severity), msg);
@@ -76,14 +60,12 @@ typedef void (*coroutine_func)(mco_coro *);
 // Closures can be reused, no need to recreate it all the time
 uel_closure_t easync_resume_coro_clo;
 uel_closure_t easync_timeout_coro_clo;
+
 #define SIGNAL_QUEUE_BUFFER_SIZE_LOG2N (4)
 uel_cqueue_t easync_signal_closure_queue[32];
 void *_easync_signal_closure_buffer[32 * (1 << SIGNAL_QUEUE_BUFFER_SIZE_LOG2N)];
+
 bool easync_resume_coroutine(coroutine_func fp, void *user_data);
-const char *mco_state_str[] = {[MCO_DEAD] = "MCO_DEAD",
-                               [MCO_NORMAL] = "MCO_NORMAL",
-                               [MCO_RUNNING] = "MCO_RUNNING",
-                               [MCO_SUSPENDED] = "MCO_SUSPENDED"};
 
 // Tick the timer every ms
 void easync_timer_isr() { uel_app_update_timer(&eyra_app, ++counter); }
@@ -269,6 +251,8 @@ void *easync_timeout_coro_func(void *context, void *params) {
   return NULL;
 }
 
+/// start timer
+// Poor mans timer interrupt :(
 int timerfd = 0;
 void wait_timer() {
   uint64_t exp, tot_exp, max_exp;
@@ -290,46 +274,37 @@ void setup_timer(void) {
 
   ULOG_INFO("timer started");
 }
+/// end timer
+
+/// Signal handler / poor-mans TX/RX interruot
 void usr2_handler(int sig) {
   static int current_val = 0;
+  // Check if anyone is waiting for the signal
   mco_coro *co = uel_cqueue_pop(&easync_signal_closure_queue[SIGUSR2]);
   if (co == NULL) {
     ULOG_INFO("No task waiting for signal %d", SIGUSR2);
     return;
   }
-
   ULOG_INFO("coroutine %p waiting to resume=> %s", co, mco_state_str[mco_status(co)]);
+  // If the coroutine is suspended, resume it
+  // Anything else here would be weird
   if (mco_status(co) == MCO_SUSPENDED) {
     uel_app_enqueue_closure(&eyra_app, &easync_resume_coro_clo, co);
   } else {
-
-    ULOG_INFO("coroutine %p: %s", co, mco_state_str[mco_status(co)]);
+    ULOG_ERROR("Attempting to resume coroutine %p in state: %s", co, mco_state_str[mco_status(co)]);
   }
 }
 
 int main(int argc, char **argv) {
   ULOG_INIT();
-
-  // log messages with a severity of WARNING or higher to the console.  The
-  // user must supply a method for my_console_logger, e.g. along the lines
-  // of what is shown above.
   ULOG_SUBSCRIBE(my_console_logger, ULOG_DEBUG_LEVEL);
-
-  // log messages with a severity of DEBUG or higher to a file.  The user must
-  // provide a method for my_file_logger (not shown here).
-  /* ULOG_SUBSCRIBE(my_file_logger, ULOG_DEBUG_LEVEL); */
-
-  /* ULOG_INFO("Info, arg=%d", arg);        // logs to file but not console */
-  /* ULOG_CRITICAL("Critical, arg=%d", arg);  // logs to file and console */
-
+  ULOG_SUBSCRIBE(my_file_logger, ULOG_DEBUG_LEVEL);
   // dynamically change the threshold for a specific logger
   /* ULOG_SUBSCRIBE(my_console_logger, ULOG_INFO_LEVEL); */
 
-  ULOG_INFO("ULOG TEST"); // logs to file and console
-
+  ULOG_INFO("Starting.."); // logs to file and console
   // remove a logger
   /* ULOG_UNSUBSCRIBE(my_file_logger); */
-
   /* signal(SIGUSR1, usr1_handler); */
   signal(SIGUSR2, usr2_handler);
   uel_app_init(&eyra_app);
@@ -343,31 +318,6 @@ int main(int argc, char **argv) {
                     SIGNAL_QUEUE_BUFFER_SIZE_LOG2N);
   }
 
-  /* log_cqueue(&easync_signal_closure_queue[10], "before push"); */
-  /* uel_cqueue_push(&easync_signal_closure_queue[10], 0x1); */
-  /* uel_cqueue_push(&easync_signal_closure_queue[10], 0x2); */
-  /* uel_cqueue_push(&easync_signal_closure_queue[10], 0x3); */
-  /* uel_cqueue_push(&easync_signal_closure_queue[10], 0x4); */
-  /* uel_cqueue_push(&easync_signal_closure_queue[10], 0x5); */
-  /* uel_cqueue_push(&easync_signal_closure_queue[10], 0x1); */
-  /* log_cqueue(&easync_signal_closure_queue[10], "after push"); */
-
-  /* int count = uel_cqueue_count(&easync_signal_closure_queue[10]); */
-  /* for(int i = 0; i < count; i++){ */
-  /*  void *e = uel_cqueue_pop(&easync_signal_closure_queue[10]); */
-  /*  if(e != 0x3){ */
-  /*    uel_cqueue_push(&easync_signal_closure_queue[10], e); */
-  /*  } */
-  /* } */
-  /* log_cqueue(&easync_signal_closure_queue[10], "after filter"); */
-
-  /*  void *e = uel_cqueue_pop(&easync_signal_closure_queue[10]); */
-  /*  while(e){ */
-  /*    printf("Order in queue: %p\n", e); */
-  /*  e = uel_cqueue_pop(&easync_signal_closure_queue[10]); */
-  /*  } */
-
-  /*  return 1; */
 
   // Initalize the closure that resumes coroutines passed as argument
   // Context == null, coroutine comes in param
@@ -395,4 +345,40 @@ bool easync_resume_coroutine(coroutine_func fp, void *user_data) {
   assert(mco_status(co) == MCO_SUSPENDED);
   uel_app_enqueue_closure(&eyra_app, &easync_resume_coro_clo, co);
   return true;
+}
+
+char *get_timestamp(void) {
+  struct timespec tv;
+  char time_str[127];
+  double fractional_seconds;
+  int milliseconds;
+  struct tm tm; // our "broken down time"
+
+  if (clock_gettime(CLOCK_REALTIME, &tv) == -1) {
+    perror("clock_gettime");
+    exit(EXIT_FAILURE);
+  }
+
+  memset(&tm, 0, sizeof(struct tm));
+  sprintf(time_str, "%ld UTC", tv.tv_sec);
+
+  // convert our timespec into broken down time
+  strptime(time_str, "%s %U", &tm);
+
+  // do the math to convert nanoseconds to integer milliseconds
+  fractional_seconds = (double)tv.tv_nsec;
+  fractional_seconds /= 1e6;
+  fractional_seconds = round(fractional_seconds);
+  milliseconds = (int)fractional_seconds;
+
+  // print date and time without milliseconds
+
+  //ISO8601
+  //strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S", &tm);
+  strftime(time_str, sizeof(time_str), "%H:%M:%S", &tm);
+
+  // add on the fractional seconds and Z for the UTC Timezone
+  snprintf(timestamp, sizeof(timestamp), "%s.%.5d", time_str, milliseconds);
+
+  return timestamp;
 }
