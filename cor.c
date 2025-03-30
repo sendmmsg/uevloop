@@ -1,6 +1,3 @@
-#include "uevloop/utils/linked-list.h"
-#include "uevloop/utils/module.h"
-#include <bits/time.h>
 #include "uevloop/system/containers/application.h"
 #include "uevloop/system/containers/system-pools.h"
 #include "uevloop/system/containers/system-queues.h"
@@ -8,7 +5,10 @@
 #include "uevloop/system/scheduler.h"
 #include "uevloop/utils/circular-queue.h"
 #include "uevloop/utils/closure.h"
+#include "uevloop/utils/linked-list.h"
+#include "uevloop/utils/module.h"
 #include "uevloop/utils/object-pool.h"
+#include <bits/time.h>
 #include <bits/types/timer_t.h>
 #include <err.h>
 #include <inttypes.h>
@@ -25,70 +25,78 @@
 #include "ulog.h"
 #define _XOPEN_SOURCE /* See feature_test_macros(7) */
 #include <time.h>
-void *my_alloc(size_t size);
-void my_dealloc(void *ptr);
-#define MCO_ALLOC(size) my_alloc(size)
-#define MCO_DEALLOC(ptr, size) my_dealloc(ptr)
+
+void *objpool_acquire_coro_stack(size_t size);
+void objpool_release_coro_stack(void *ptr);
+#define MCO_ALLOC(size) objpool_acquire_coro_stack(size)
+#define MCO_DEALLOC(ptr, size) objpool_release_coro_stack(ptr)
+#define MCO_LOG ULOG_ERROR
 #define MINICORO_IMPL
 #include "minicoro.h"
-char timestamp[256];
-char* get_timestamp();
-int allocs = 0;
 
+//
+// Memory management for coroutine stacks
+//
+int allocs = 0;
+// should match mco_desc.storage_size
+// which is determined on runtime (depending on arch, mechanism?)
 typedef struct _coro_stack {
-  // should match mco_desc.storage_size
-  // which is determined on runtime (depending on arch, mechanism?)
-    char str[58656];
+  char str[58656];
 } coro_stack_t;
 
-
-// The log2 of our pool size.
-#define CORO_STACK_POOL_SIZE_LOG2N   (5)
+// Metadata+stacks for 2**5=32 concurrent coroutines
+#define CORO_STACK_POOL_SIZE_LOG2N (5)
 UEL_DECLARE_OBJPOOL_BUFFERS(coro_stack_t, CORO_STACK_POOL_SIZE_LOG2N, coro_stack_pool);
 uel_objpool_t coro_stack_pool;
-// my_pool now is a pool with 32 (2**5) obj_t
 
-void my_dealloc(void *ptr){
-  allocs--;
-  ULOG_WARNING("De-allocating pointer %p, allocs: %d\n", ptr, allocs);
-  uel_objpool_release(&coro_stack_pool, ptr);
-}
-void *my_alloc(size_t size){
+void *objpool_acquire_coro_stack(size_t size) {
   allocs++;
   void *ptr = uel_objpool_acquire(&coro_stack_pool);
   ULOG_WARNING("Allocated pointer %p, size: %ld, allocs: %d\n", ptr, size, allocs);
 
   return ptr;
 }
+void objpool_release_coro_stack(void *ptr) {
+  allocs--;
+  ULOG_WARNING("De-allocating pointer %p, allocs: %d\n", ptr, allocs);
+  uel_objpool_release(&coro_stack_pool, ptr);
+}
 
+//
+// Logging, should go to separate logging module
+//
+
+char timestamp[256];
+char *get_timestamp();
+
+FILE *fp_log_file = NULL;
+void my_file_logger(ulog_level_t severity, char *msg) {
+  if (fp_log_file == NULL) {
+    fprintf(stderr, "log file must be opened before logging to it!\n");
+    exit(1);
+  }
+
+  fseek(fp_log_file, 0, SEEK_END);
+  fprintf(fp_log_file, "%s [%s]: %s\n", get_timestamp(), ulog_level_name(severity), msg);
+  fflush(fp_log_file);
+}
+void my_console_logger(ulog_level_t severity, char *msg) {
+  printf("%s %s [%s]:%s %s\n", ulog_level_color(severity), get_timestamp(), ulog_level_name(severity), "\033[37m", msg);
+}
+
+//
+// Event loop, closures
+//
 
 const char *mco_state_str[] = {[MCO_DEAD] = "MCO_DEAD",
                                [MCO_NORMAL] = "MCO_NORMAL",
                                [MCO_RUNNING] = "MCO_RUNNING",
                                [MCO_SUSPENDED] = "MCO_SUSPENDED"};
-
-FILE* fp_log_file = NULL;
-void my_file_logger(ulog_level_t severity, char *msg) {
-  if(fp_log_file == NULL) {
-    fprintf(stderr,"log file must be opened before logging to it!\n");
-    exit(1);
-  }
-
-  fseek(fp_log_file,0, SEEK_END);
-  fprintf(fp_log_file, "%s [%s]: %s\n", get_timestamp(), ulog_level_name(severity), msg);
-  fflush(fp_log_file);
-}
-void my_console_logger(ulog_level_t severity, char *msg) {
-  printf("%s %s [%s]: %s\n", ulog_level_color(severity), get_timestamp(), ulog_level_name(severity), msg);
-}
-
 bool keep_running = true;
 static volatile uint32_t counter = 0;
 uel_event_t *timer_handle;
 uel_application_t eyra_app;
-
 typedef void (*coroutine_func)(mco_coro *);
-
 // Closures can be reused, no need to recreate it all the time
 uel_closure_t easync_resume_coro_clo;
 uel_closure_t easync_timeout_coro_clo;
@@ -98,116 +106,134 @@ uel_closure_t raise_signal_clo;
 uel_cqueue_t easync_signal_closure_queue[32];
 void *_easync_signal_closure_buffer[32 * (1 << SIGNAL_QUEUE_BUFFER_SIZE_LOG2N)];
 
-
-
-
-
-
 bool easync_spawn_coroutine(coroutine_func fp, void *user_data);
 // Tick the timer every ms
 void easync_timer_isr() { uel_app_update_timer(&eyra_app, ++counter); }
 
-static void *print_value(void *context, void *parameters) {
-  uintptr_t v = (uintptr_t)parameters;
-  int enqueued = uel_sysqueues_count_enqueued_events(&eyra_app.queues);
-  int scheduled = uel_sysqueues_count_scheduled_events(&eyra_app.queues);
-  ULOG_INFO("Closure scheduled: %ld queued: %d scheduled: %d", v, enqueued, scheduled);
 
-  return NULL;
-}
-static void *delay_print_value(void *context, void *parameters) {
-  uintptr_t v = (uintptr_t)parameters;
-  int enqueued = uel_sysqueues_count_enqueued_events(&eyra_app.queues);
-  int scheduled = uel_sysqueues_count_scheduled_events(&eyra_app.queues);
-  ULOG_INFO("delayed: %ld queued: %d scheduled: %d", v, enqueued, scheduled);
-  return NULL;
-}
+//
+// Async coroutine handling
+// Combines minicoro + uevloop to do crazy stuff
+//
 
-static void *abort_loop(void *context, void *parameters) {
-  uintptr_t v = (uintptr_t)parameters;
-  keep_running = false;
-  return NULL;
-}
-
-// 16 entries circular queue
-
+typedef enum _easync_signal { SIGNAL_OK = 100, SIGNAL_TIMEOUT = 101, SIGNAL_CANCELLED = 102, SIGNAL_ABORT } easync_signal_t;
 /**
  * Schedule a uel closure that calls to mco_resume(task) in the future.
  * Then yield, returning to the closure that woke us up
  * Basically our version of "await Task.Delay()"
+ * returns a easync_signal_t indicating if everything when ok, or if we got cancelled
  */
-void easync_task_delay(mco_coro *task, uel_application_t *app, int delay_ms) {
-  uel_app_run_later(app, delay_ms, easync_resume_coro_clo, task);
+easync_signal_t easync_task_delay(mco_coro *task, uel_application_t *app, int delay_ms) {
+  uel_event_t *timer_event = uel_app_run_later(app, delay_ms, easync_resume_coro_clo, task);
   mco_yield(task);
-}
-enum EasyncSignal { SIGNAL_OK = 100, SIGNAL_TIMEOUT = 101, SIGNAL_CANCELLED = 102, SIGNAL_ABORT };
-/**
- * Schedule a uel closure that calls to mco_resume(task) when a signal is received.
- * Then yield, returning to the closure that woke us up
- * Basically our version of "await signal.WaitAsync()" or something like that
- */
-enum EasyncSignal easync_task_await_signal(mco_coro *task, uel_application_t *app, int signal, int timeoutMS) {
-  assert(signal >= 0 && signal < 32);
-
-  /* log_cqueue(&easync_signal_closure_queue[signal], "before push"); */
-  if (!uel_cqueue_push(&easync_signal_closure_queue[signal], task)) {
-    ULOG_ERROR("Failed to enqueue task %p resume for signal %d", task, signal);
-    return SIGNAL_ABORT;
+  // Check if we got any notification (cancelled)
+  uint8_t res = SIGNAL_OK;
+  int stored = mco_get_bytes_stored(task);
+  if(stored == 0){
+    goto return_signal;
   }
-  /* log_cqueue(&easync_signal_closure_queue[signal], "after push"); */
-  ULOG_DEBUG("coroutines waiting in easync_signal_closure_queue[%d] = %ld", signal,
-             uel_cqueue_count(&easync_signal_closure_queue[signal]));
-  uel_event_t *timer_event = uel_app_run_later(&eyra_app, timeoutMS, easync_timeout_coro_clo, task);
-  mco_yield(task);
 
-  // Check if we got any notification (cancelled, timeout)
-  uint8_t res = 0;
   mco_result r = mco_pop(task, &res, 1);
   if (MCO_NOT_ENOUGH_SPACE == r) {
     ULOG_DEBUG("easync_task_await_signal -> nothing to pop, no timeout/cancellation");
+    goto return_signal;
+  }
+
+  if (MCO_SUCCESS != r) {
+    ULOG_ERROR("easync_task_await_signal -> pop failed! error %d", r);
     uel_event_timer_cancel(timer_event);
-    return SIGNAL_OK;
-  } else if (MCO_SUCCESS != r) {
-    ULOG_DEBUG("easync_task_await_signal -> pop failed! error %d", r);
-    uel_event_timer_cancel(timer_event);
+    goto return_signal;
   }
 
   int count = 0;
   switch (res) {
   case SIGNAL_OK:
     ULOG_DEBUG("easync_task_await_signal -> notification OK");
-    uel_event_timer_cancel(timer_event);
-    break;
-  case SIGNAL_TIMEOUT:
-    ULOG_DEBUG("easync_task_await_signal -> notification TIMEOUT");
-    // Iterate through the queue, removing any references to task
-    count = uel_cqueue_count(&easync_signal_closure_queue[signal]);
-    for (int i = 0; i < count; i++) {
-      void *e = uel_cqueue_pop(&easync_signal_closure_queue[signal]);
-      if (e != task) {
-        uel_cqueue_push(&easync_signal_closure_queue[signal], e);
-      }
-    }
-    return SIGNAL_TIMEOUT;
-    break;
+    goto return_signal;
   case SIGNAL_CANCELLED:
-    ULOG_DEBUG("easync_task_await_signal -> notification CANCELLED");
-    count = uel_cqueue_count(&easync_signal_closure_queue[signal]);
-    for (int i = 0; i < count; i++) {
-      void *e = uel_cqueue_pop(&easync_signal_closure_queue[signal]);
-      if (e != task) {
-        uel_cqueue_push(&easync_signal_closure_queue[signal], e);
-      }
-    }
+    ULOG_WARNING("easync_task_await_signal -> notification CANCELLED");
     uel_event_timer_cancel(timer_event);
-    return SIGNAL_CANCELLED;
-    break;
+    goto return_signal;
   default:
-    ULOG_DEBUG("easync_task_await_signal -> notification UNKNOWN(%d)", res);
+    ULOG_ERROR("easync_task_await_signal -> notification UNKNOWN(%d)", res);
     break;
   }
-  return SIGNAL_OK;
+  return_signal:
+  return res;
 }
+
+void remove_from_signal_closure_queue(mco_coro *task, int signal){
+    // Iterate through the queue, removing any references to task
+    int count = uel_cqueue_count(&easync_signal_closure_queue[signal]);
+    for (int i = 0; i < count; i++) {
+      void *e = uel_cqueue_pop(&easync_signal_closure_queue[signal]);
+      if (e != task) {
+        uel_cqueue_push(&easync_signal_closure_queue[signal], e);
+      }
+    }
+}
+/**
+ * Schedule a uel closure that calls to mco_resume(task) when a signal is received.
+ * Then yield, returning to the closure that woke us up
+ * Basically our version of "await signal.WaitAsync()" or something like that
+ * returns a easync_signal_t indicating if everything when ok, or if we got cancelled
+ */
+easync_signal_t easync_task_await_signal(mco_coro *task, uel_application_t *app, int signal, int timeoutMS) {
+  assert(signal >= 0 && signal < 32);
+
+  if (!uel_cqueue_push(&easync_signal_closure_queue[signal], task)) {
+    ULOG_ERROR("Failed to enqueue task %p resume for signal %d", task, signal);
+    return SIGNAL_ABORT;
+  }
+  /* ULOG_DEBUG("coroutines waiting in easync_signal_closure_queue[%d] = %ld", signal, */
+  /*            uel_cqueue_count(&easync_signal_closure_queue[signal])); */
+  uel_event_t *timeout_event = uel_app_run_later(&eyra_app, timeoutMS, easync_timeout_coro_clo, task);
+  mco_yield(task);
+
+  uint8_t res = SIGNAL_OK;
+  // Check if we got any notification (cancelled, timeout)
+  int stored = mco_get_bytes_stored(task);
+  if (stored == 0) {
+    // Nothing passed to us, everything fine
+    ULOG_DEBUG("easync_task_await_signal -> nothing to pop, no timeout/cancellation");
+    uel_event_timer_cancel(timeout_event);
+    goto return_signal;
+  }
+
+  // Try to pop the message
+  mco_result r = mco_pop(task, &res, 1);
+  if (MCO_SUCCESS != r) {
+    ULOG_ERROR("easync_task_await_signal -> pop failed! error %d", r);
+    uel_event_timer_cancel(timeout_event);
+  }
+
+  // Check message content
+  int count = 0;
+  switch (res) {
+  case SIGNAL_OK:
+    ULOG_DEBUG("easync_task_await_signal -> notification OK");
+    uel_event_timer_cancel(timeout_event);
+    goto return_signal;
+  case SIGNAL_TIMEOUT:
+    ULOG_WARNING("easync_task_await_signal -> got notification 'TIMEOUT'");
+    remove_from_signal_closure_queue(task, signal);
+    goto return_signal;
+  case SIGNAL_CANCELLED:
+    ULOG_WARNING("easync_task_await_signal -> got notification 'CANCELLED'");
+    remove_from_signal_closure_queue(task,  signal);
+    uel_event_timer_cancel(timeout_event);
+    goto return_signal;
+  default:
+    ULOG_ERROR("easync_task_await_signal -> notification UNKNOWN(%d)", res);
+    break;
+  }
+
+  return_signal:
+
+  return res;
+}
+
+
 
 // MCO coroutine that can resume/yield/die
 // Yields into a wakeup from signal USR1
@@ -239,6 +265,35 @@ void async_print_and_wait_signal(mco_coro *task) {
   }
 }
 
+
+//
+// "Regular" event loop user functions
+//
+
+static void *print_value(void *context, void *parameters) {
+  uintptr_t v = (uintptr_t)parameters;
+  int enqueued = uel_sysqueues_count_enqueued_events(&eyra_app.queues);
+  int scheduled = uel_sysqueues_count_scheduled_events(&eyra_app.queues);
+  ULOG_INFO("Closure scheduled: %ld queued: %d scheduled: %d", v, enqueued, scheduled);
+
+  return NULL;
+}
+
+static void *delay_print_value(void *context, void *parameters) {
+  uintptr_t v = (uintptr_t)parameters;
+  int enqueued = uel_sysqueues_count_enqueued_events(&eyra_app.queues);
+  int scheduled = uel_sysqueues_count_scheduled_events(&eyra_app.queues);
+  ULOG_INFO("delayed: %ld queued: %d scheduled: %d", v, enqueued, scheduled);
+  return NULL;
+}
+
+static void *abort_loop(void *context, void *parameters) {
+  uintptr_t v = (uintptr_t)parameters;
+  keep_running = false;
+  return NULL;
+}
+
+
 // MCO coroutine that can resume/yield/die
 // Yields into a schedulued wakeup
 void async_print_and_delay(mco_coro *task) {
@@ -254,32 +309,32 @@ void async_print_and_delay(mco_coro *task) {
 }
 
 char uart_buffer[1024];
-// MCO coroutine that "transmits over UART", waits on TX completion, "registers to receive on UART" and awaits RX completion
+// MCO coroutine that "transmits over UART", waits on TX completion, "registers to receive on UART" and awaits RX
+// completion
 void uart_send_and_receive(mco_coro *task) {
   ULOG_INFO("started");
   // tell the evloop to send a "TX completion signal"
-  uel_app_run_later(&eyra_app, 10, raise_signal_clo,(void*)(uintptr_t) SIGURG);
+  uel_app_run_later(&eyra_app, 10, raise_signal_clo, (void *)(uintptr_t)SIGURG);
   ULOG_INFO("Sending message");
   snprintf(uart_buffer, 1024, "Sending some data: %p", task);
   ULOG_INFO(" Yielding until TX interrupt (SIGURG)");
   int rc = easync_task_await_signal(task, &eyra_app, SIGURG, 5000);
-    if (rc == SIGNAL_TIMEOUT) {
-      ULOG_ERROR("async_print_and_wait_signal -> timeout in waiting for signal, aborting!");
-      return;
-    }
-    if (rc == SIGNAL_CANCELLED) {
-      ULOG_ERROR("async_print_and_wait_signal -> task cancelled, returning!");
-      return;
-    }
+  if (rc == SIGNAL_TIMEOUT) {
+    ULOG_ERROR("async_print_and_wait_signal -> timeout in waiting for signal, aborting!");
+    return;
+  }
+  if (rc == SIGNAL_CANCELLED) {
+    ULOG_ERROR("async_print_and_wait_signal -> task cancelled, returning!");
+    return;
+  }
   ULOG_INFO("TX completed, now waiting for response (SIGVTALRM)");
   // tell the evloop to send a "RX completion signal"
-  uel_app_run_later(&eyra_app, 10, raise_signal_clo,(void*)(uintptr_t) SIGVTALRM);
+  uel_app_run_later(&eyra_app, 10, raise_signal_clo, (void *)(uintptr_t)SIGVTALRM);
   rc = easync_task_await_signal(task, &eyra_app, SIGVTALRM, 5000);
   ULOG_INFO("RX completed! Got %s", uart_buffer);
-
 }
 void *raise_signal_func(void *context, void *params) {
-  uintptr_t signal = (uintptr_t) params;
+  uintptr_t signal = (uintptr_t)params;
   ULOG_INFO("sending signal");
   raise(signal);
 }
@@ -368,7 +423,7 @@ void usr1_handler(int sig) {
   keep_running = false;
 }
 
-void cont_handler(int sig){
+void cont_handler(int sig) {
   // spawn a coroutine that transmits over UART, and receives a reply
   easync_spawn_coroutine(uart_send_and_receive, (void *)(uintptr_t)1000);
 }
@@ -402,12 +457,16 @@ int main(int argc, char **argv) {
 
   // Initalize the space for the coroutine-stacks
   // Used by MCO_ALLOC / MCO_DEALLOC
-  uel_objpool_init(&coro_stack_pool, CORO_STACK_POOL_SIZE_LOG2N, sizeof(coro_stack_t), UEL_OBJPOOL_BUFFERS(coro_stack_pool));
+  uel_objpool_init(&coro_stack_pool, CORO_STACK_POOL_SIZE_LOG2N, sizeof(coro_stack_t),
+                   UEL_OBJPOOL_BUFFERS(coro_stack_pool));
 
   // Initalize the closure that resumes coroutines passed as argument
   // Context == null, coroutine comes in param
   easync_resume_coro_clo = uel_closure_create(&easync_resume_coro_func, (void *)NULL);
+
+  // Initalize the closure that times out a coroutines passed as argument
   easync_timeout_coro_clo = uel_closure_create(&easync_timeout_coro_func, (void *)NULL);
+
   raise_signal_clo = uel_closure_create(&raise_signal_func, (void *)NULL);
 
   uintptr_t value = 0;
@@ -422,7 +481,7 @@ int main(int argc, char **argv) {
     uel_app_tick(&eyra_app);
   }
   ULOG_INFO("Quitting");
-  if(fp_log_file)
+  if (fp_log_file)
     fclose(fp_log_file);
 }
 bool easync_spawn_coroutine(coroutine_func fp, void *user_data) {
@@ -460,12 +519,9 @@ char *get_timestamp(void) {
   fractional_seconds = round(fractional_seconds);
   milliseconds = (int)fractional_seconds;
 
-  // print date and time without milliseconds
-
-  //ISO8601
-  //strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S", &tm);
+  // ISO8601
+  // strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%S", &tm);
   strftime(time_str, sizeof(time_str), "%H:%M:%S", &tm);
-
   // add on the fractional seconds and Z for the UTC Timezone
   snprintf(timestamp, sizeof(timestamp), "%s.%.5d", time_str, milliseconds);
 

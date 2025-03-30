@@ -104,7 +104,7 @@ const char *ulog_level_color(ulog_level_t severity) {
    case ULOG_TRACE_LEVEL: return "\033[92m";
    case ULOG_DEBUG_LEVEL: return "\033[94m";
    case ULOG_INFO_LEVEL: return "\033[92m";
-   case ULOG_WARNING_LEVEL: return "\033[95m]";
+   case ULOG_WARNING_LEVEL: return "\033[95m";
    case ULOG_ERROR_LEVEL: return "\033[91m";
    case ULOG_CRITICAL_LEVEL: return "\033[41;37m";
    case ULOG_ALWAYS_LEVEL: return "\033[41;37m";
@@ -130,6 +130,8 @@ void ulog_message(ulog_level_t severity,char *filename, int lineno, const char *
     return;
   }
 
+  // limit min/max str padding/cutoff. Not much nicer
+  //int consumed = snprintf(s_message, ULOG_MAX_MESSAGE_LENGTH, "%20.20s (%5.5s:%5d) ", func, filename, lineno);
   int consumed = snprintf(s_message, ULOG_MAX_MESSAGE_LENGTH, "%s (%s:%d) ", func, filename, lineno);
   va_list ap;
   int i;

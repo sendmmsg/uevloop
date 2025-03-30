@@ -142,7 +142,6 @@ ulog_err_t ulog_subscribe(ulog_function_t fn, ulog_level_t threshold);
 ulog_err_t ulog_unsubscribe(ulog_function_t fn);
 const char *ulog_level_name(ulog_level_t level);
 const char *ulog_level_color(ulog_level_t level);
-//void ulog_message(ulog_level_t severity, const char *fmt, ...);
 void ulog_message(ulog_level_t severity,char *filename, int lineno, const char* func, const char *fmt, ...);
 #ifdef __cplusplus
 }
